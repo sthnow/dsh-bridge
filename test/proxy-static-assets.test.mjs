@@ -19,13 +19,16 @@ function read(port, path, headers = {}) {
   })
 }
 
-test('proxy negotiates compression and private freshness only for fingerprinted shell assets', async (t) => {
+test('proxy negotiates compression only for fingerprinted shell assets without changing cache policy', async (t) => {
   const seen = []
   const upstream = createServer((req, res) => {
     seen.push(req.headers['accept-encoding'])
     if (req.url === '/' || req.url === '/assets/index-Fallback.js') {
-      res.writeHead(200, { 'content-type': 'text/html', 'cache-control': 'no-cache' })
-      res.end('<html><head></head><body>shell</body></html>')
+      const html = '<html><head></head><body>shell</body></html>'
+      const headers = { 'content-type': 'text/html', 'cache-control': 'no-cache', vary: 'Accept-Encoding' }
+      if (req.headers['accept-encoding'] === 'gzip') headers['content-encoding'] = 'gzip'
+      res.writeHead(200, headers)
+      res.end(headers['content-encoding'] ? gzipSync(html) : html)
       return
     }
     const headers = {
@@ -66,7 +69,9 @@ test('proxy negotiates compression and private freshness only for fingerprinted 
 
   const compressed = await read(port, asset, client)
   assert.equal(compressed.status, 200)
-  assert.equal(compressed.headers['cache-control'], 'private, max-age=31536000, immutable')
+  assert.equal(compressed.headers['cache-control'], 'no-cache')
+  assert.equal(compressed.headers.etag, etag)
+  assert.equal(seen.at(-1), 'gzip')
   assert.equal(compressed.headers['content-encoding'], 'gzip')
   assert.equal(compressed.headers.vary, 'Accept-Encoding')
   assert.deepEqual(gunzipSync(compressed.body), source)
@@ -78,18 +83,29 @@ test('proxy negotiates compression and private freshness only for fingerprinted 
   const revalidated = await read(port, asset, { ...client, 'if-none-match': compressed.headers.etag })
   assert.equal(revalidated.status, 304)
   assert.equal(revalidated.body.length, 0)
+  assert.equal(revalidated.headers['cache-control'], 'no-cache')
+  assert.equal(revalidated.headers.etag, etag)
+  assert.equal(revalidated.headers.vary, 'Accept-Encoding')
+
+  const range = await read(port, asset, { ...client, range: 'bytes=0-9' })
+  assert.equal(seen.at(-1), undefined)
+  assert.equal(range.headers['content-encoding'], undefined)
 
   for (const [path, expected] of [
     ['/assets/index-NoStore0.js', 'no-store'], ['/assets/index-Cookie00.js', 'no-cache'],
     ['/assets/index-Fallback.js', 'no-cache'], [`${asset}?dynamic=1`, 'no-cache'],
     ['/api/data', 'no-cache'], ['/plugin/client.js', 'no-cache'], ['/', 'no-cache'],
   ]) {
+    const start = seen.length
     const response = await read(port, path, client)
     assert.equal(response.headers['cache-control'], expected, path)
-    if (path === '/') {
-      assert.equal(seen.at(-1), undefined)
+    if (path === '/assets/index-Fallback.js' || path === '/') {
+      assert.equal(response.headers['content-encoding'], undefined)
+      assert.equal(Number(response.headers['content-length']), response.body.length)
       assert.match(response.body.toString(), /data-dsh-bridge-polyfill/)
     }
-    if (path === '/api/data' || path === '/plugin/client.js') assert.equal(seen.at(-1), undefined)
+    const negotiation = path === '/assets/index-Fallback.js' ? ['gzip', undefined]
+      : path.startsWith('/assets/') && !path.includes('?') ? ['gzip'] : [undefined]
+    assert.deepEqual(seen.slice(start), negotiation, path)
   }
 })
